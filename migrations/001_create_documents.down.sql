@@ -1,0 +1,2 @@
+DROP TABLE IF EXISTS crawl_queue;
+DROP TABLE IF EXISTS documents;
