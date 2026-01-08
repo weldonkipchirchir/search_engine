@@ -1,0 +1,230 @@
+name: Indexer CI/CD
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'indexer/**'
+      - '.github/workflows/indexer.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'indexer/**'
+  workflow_dispatch:
+
+env:
+  RUST_VERSION: '1.75'
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/indexer
+
+jobs:
+  # Job 1: Test
+  test:
+    name: Test Indexer
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: search_engine_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: ${{ env.RUST_VERSION }}
+          override: true
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: indexer/target
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install dependencies
+        working-directory: ./indexer
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev
+
+      - name: Check formatting
+        working-directory: ./indexer
+        run: cargo fmt -- --check
+
+      - name: Run clippy (linter)
+        working-directory: ./indexer
+        run: cargo clippy -- -D warnings
+
+      - name: Run tests
+        working-directory: ./indexer
+        env:
+          DB_HOST: localhost
+          DB_PORT: 5432
+          DB_NAME: search_engine_test
+          DB_USER: postgres
+          DB_PASSWORD: postgres
+          RUST_BACKTRACE: 1
+        run: cargo test --verbose
+
+      - name: Generate code coverage
+        working-directory: ./indexer
+        run: |
+          cargo install cargo-tarpaulin
+          cargo tarpaulin --out Html --output-dir coverage
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: indexer-coverage
+          path: indexer/coverage/
+
+  # Job 2: Build
+  build:
+    name: Build Indexer
+    runs-on: ubuntu-latest
+    needs: test
+    
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          # - aarch64-unknown-linux-gnu  # For ARM (optional)
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: ${{ env.RUST_VERSION }}
+          target: ${{ matrix.target }}
+          override: true
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev
+
+      - name: Build release binary
+        working-directory: ./indexer
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: indexer-binary-${{ matrix.target }}
+          path: indexer/target/${{ matrix.target }}/release/indexer
+
+  # Job 3: Security Audit
+  security:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: ${{ env.RUST_VERSION }}
+          override: true
+
+      - name: Run cargo audit
+        working-directory: ./indexer
+        run: |
+          cargo install cargo-audit
+          cargo audit
+
+  # Job 4: Build and Push Docker Image
+  docker:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    needs: [build, security]
+    if: github.event_name != 'pull_request'
+    
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.indexer
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+
+  # Job 5: Deploy
+  deploy:
+    name: Deploy Indexer
+    runs-on: ubuntu-latest
+    needs: docker
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Deploy to production
+        run: |
+          echo "Deploying indexer to production..."
+          # Add your deployment commands here
