@@ -1,0 +1,180 @@
+name: Crawler CI/CD
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'crawler/**'
+      - '.github/workflows/crawler.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'crawler/**'
+  workflow_dispatch:  # Manual trigger
+
+env:
+  GO_VERSION: '1.21'
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/crawler
+
+jobs:
+  # Job 1: Test
+  test:
+    name: Test Crawler
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: search_engine_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: crawler/go.sum
+
+      - name: Install dependencies
+        working-directory: ./crawler
+        run: |
+          go mod download
+          go mod verify
+
+      - name: Run tests
+        working-directory: ./crawler
+        env:
+          DB_HOST: localhost
+          DB_PORT: 5432
+          DB_NAME: search_engine_test
+          DB_USER: postgres
+          DB_PASSWORD: postgres
+        run: |
+          go test -v -race -coverprofile=coverage.out ./...
+          go tool cover -html=coverage.out -o coverage.html
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: crawler-coverage
+          path: crawler/coverage.html
+
+      - name: Run linter
+        working-directory: ./crawler
+        run: |
+          go install golang.org/x/lint/golint@latest
+          golint ./...
+
+      - name: Check formatting
+        working-directory: ./crawler
+        run: |
+          if [ "$(gofmt -s -l . | wc -l)" -gt 0 ]; then
+            echo "Code needs formatting:"
+            gofmt -s -l .
+            exit 1
+          fi
+
+  # Job 2: Build
+  build:
+    name: Build Crawler
+    runs-on: ubuntu-latest
+    needs: test
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Build binary
+        working-directory: ./crawler
+        run: |
+          CGO_ENABLED=1 GOOS=linux go build -a -installsuffix cgo -o crawler ./cmd/crawler
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: crawler-binary
+          path: crawler/crawler
+
+  # Job 3: Build and Push Docker Image
+  docker:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name != 'pull_request'
+    
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.crawler
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Job 4: Deploy (optional)
+  deploy:
+    name: Deploy Crawler
+    runs-on: ubuntu-latest
+    needs: docker
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Deploy to production
+        run: |
+          echo "Deploying crawler to production..."
+          # Add your deployment commands here
+          # Examples:
+          # - kubectl apply -f k8s/crawler-deployment.yml
+          # - ssh deploy@server "docker pull ... && docker-compose up -d crawler"
+          # - aws ecs update-service --cluster ... --service crawler
